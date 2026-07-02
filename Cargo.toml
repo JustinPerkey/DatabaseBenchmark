@@ -1,0 +1,40 @@
+[package]
+name = "db-benchmark"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark suite comparing Rust database drivers and ORMs across SQLite and PostgreSQL"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Raw drivers (baselines)
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-postgres = "0.7"
+
+# SQLx — async SQL toolkit (not a full ORM)
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "postgres",
+    "derive",
+] }
+
+# Diesel — sync, compile-time-checked query builder / ORM
+diesel = { version = "2.2", features = [
+    "sqlite",
+    "postgres",
+    "returning_clauses_for_sqlite_3_35",
+] }
+
+# SeaORM — async, dynamic ORM built on SQLx
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
