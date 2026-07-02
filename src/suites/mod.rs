@@ -4,6 +4,7 @@ pub mod diesel_postgres;
 pub mod diesel_schema;
 pub mod diesel_sqlite;
 pub mod rusqlite_sqlite;
+pub mod rusqlite_sqlite_readonly;
 pub mod seaorm_entities;
 pub mod seaorm_postgres;
 pub mod seaorm_sqlite;
@@ -29,6 +30,11 @@ pub const POSTGRES_URL: &str = "postgres://bench:bench@127.0.0.1:5432/bench";
 /// one timed unit of work. Suites run sequentially and own their schema.
 pub trait Suite {
     fn name(&self) -> &'static str;
+    /// True for suites that open the database read-only; the harness skips
+    /// the write operations for them.
+    fn read_only(&self) -> bool {
+        false
+    }
     /// Drop/create the schema and seed identical data via raw SQL.
     fn setup(&mut self, delete_rows: u32) -> Result<()>;
     /// Insert a single row.

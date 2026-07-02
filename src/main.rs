@@ -16,10 +16,13 @@ const OPS: [&str; 7] = [
     "update_one",
     "delete_one",
 ];
+/// Indices into OPS of the read operations (the only ones read-only suites run).
+const READ_OPS: [usize; 3] = [2, 3, 4];
 
 struct SuiteResult {
     name: &'static str,
-    stats: Vec<OpStats>,
+    /// One entry per OPS; None when the suite is read-only and the op writes.
+    stats: Vec<Option<OpStats>>,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +51,11 @@ fn main() -> Result<()> {
         Box::new(suites::rusqlite_sqlite::RusqliteSqlite::new(sqlite_db(
             "rusqlite",
         ))?),
+        Box::new(
+            suites::rusqlite_sqlite_readonly::RusqliteSqliteReadonly::new(sqlite_db(
+                "rusqlite_ro",
+            ))?,
+        ),
         Box::new(suites::sqlx_sqlite::SqlxSqlite::new(sqlite_db("sqlx"))?),
         Box::new(suites::diesel_sqlite::DieselSqlite::new(sqlite_db(
             "diesel",
@@ -84,17 +92,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_suite(suite: &mut dyn Suite, cfg: &BenchConfig) -> Result<Vec<OpStats>> {
+fn run_suite(suite: &mut dyn Suite, cfg: &BenchConfig) -> Result<Vec<Option<OpStats>>> {
     let w = cfg.warmup;
+    let writes = !suite.read_only();
     // Order matches OPS.
     let stats = vec![
-        run_op(w, cfg.iters, |i| suite.insert_one(i))?,
-        run_op(w.min(5), cfg.bulk_iters, |i| suite.insert_bulk(i))?,
-        run_op(w, cfg.iters, |i| suite.fetch_by_id(i))?,
-        run_op(w, cfg.read_iters, |_| suite.fetch_page())?,
-        run_op(w, cfg.read_iters, |_| suite.join_query())?,
-        run_op(w, cfg.iters, |i| suite.update_one(i))?,
-        run_op(w, cfg.iters, |i| suite.delete_one(i))?,
+        if writes {
+            Some(run_op(w, cfg.iters, |i| suite.insert_one(i))?)
+        } else {
+            None
+        },
+        if writes {
+            Some(run_op(w.min(5), cfg.bulk_iters, |i| suite.insert_bulk(i))?)
+        } else {
+            None
+        },
+        Some(run_op(w, cfg.iters, |i| suite.fetch_by_id(i))?),
+        Some(run_op(w, cfg.read_iters, |_| suite.fetch_page())?),
+        Some(run_op(w, cfg.read_iters, |_| suite.join_query())?),
+        if writes {
+            Some(run_op(w, cfg.iters, |i| suite.update_one(i))?)
+        } else {
+            None
+        },
+        if writes {
+            Some(run_op(w, cfg.iters, |i| suite.delete_one(i))?)
+        } else {
+            None
+        },
     ];
     Ok(stats)
 }
@@ -112,6 +137,34 @@ fn fmt_us(us: f64) -> String {
     }
 }
 
+/// Rank a group of suites by the geometric mean of each suite's per-op
+/// slowdown vs. the group's fastest, over the given OPS indices. Every suite
+/// in `group` must have stats for every index requested.
+fn ranking_table(group: &[&SuiteResult], op_indices: &[usize]) -> String {
+    let mut out = String::from("| Rank | Suite | Relative latency |\n|---|---|---:|\n");
+    let mut scored: Vec<(&str, f64)> = group
+        .iter()
+        .map(|r| {
+            let mut log_sum = 0.0;
+            for &op_idx in op_indices {
+                let best = group
+                    .iter()
+                    .filter_map(|g| g.stats[op_idx].as_ref())
+                    .map(|s| s.median_us)
+                    .fold(f64::INFINITY, f64::min);
+                log_sum += (r.stats[op_idx].as_ref().unwrap().median_us / best).ln();
+            }
+            (r.name, (log_sum / op_indices.len() as f64).exp())
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    for (rank, (name, score)) in scored.iter().enumerate() {
+        out.push_str(&format!("| {} | {name} | {score:.2}× |\n", rank + 1));
+    }
+    out.push('\n');
+    out
+}
+
 fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
     let mut out = String::new();
     out.push_str("# Rust Database / ORM Benchmark Results\n\n");
@@ -125,24 +178,30 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         cfg.read_iters
     ));
 
-    // Per-operation tables.
+    // Per-operation tables. Read-only suites appear only in the ops they run.
     for (op_idx, op) in OPS.iter().enumerate() {
         out.push_str(&format!("## {op}\n\n"));
         out.push_str("| Suite | median | mean | p95 | ops/sec |\n");
         out.push_str("|---|---:|---:|---:|---:|\n");
         let best = results
             .iter()
-            .map(|r| r.stats[op_idx].median_us)
+            .filter_map(|r| r.stats[op_idx].as_ref())
+            .map(|s| s.median_us)
             .fold(f64::INFINITY, f64::min);
-        let mut rows: Vec<&SuiteResult> = results.iter().collect();
+        let mut rows: Vec<&SuiteResult> = results
+            .iter()
+            .filter(|r| r.stats[op_idx].is_some())
+            .collect();
         rows.sort_by(|a, b| {
             a.stats[op_idx]
+                .as_ref()
+                .unwrap()
                 .median_us
-                .partial_cmp(&b.stats[op_idx].median_us)
+                .partial_cmp(&b.stats[op_idx].as_ref().unwrap().median_us)
                 .unwrap()
         });
         for r in rows {
-            let s = &r.stats[op_idx];
+            let s = r.stats[op_idx].as_ref().unwrap();
             let marker = if (s.median_us - best).abs() < f64::EPSILON {
                 " 🏆"
             } else {
@@ -165,32 +224,33 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
     // (comparing SQLite latencies against Postgres round-trips would be
     // apples to oranges).
     out.push_str("## Overall ranking (geometric mean of relative latency, 1.00 = fastest)\n\n");
+    out.push_str("Read-only suites skip the write operations, so they are excluded here and \
+                  ranked in the read-only section below.\n\n");
+    for engine in ["SQLite", "PostgreSQL"] {
+        let group: Vec<&SuiteResult> = results
+            .iter()
+            .filter(|r| r.name.contains(engine) && r.stats.iter().all(Option::is_some))
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("### {engine}\n\n"));
+        out.push_str(&ranking_table(&group, &(0..OPS.len()).collect::<Vec<_>>()));
+    }
+
+    // Read-op-only ranking: every suite runs the reads, so this is where a
+    // read-only deployment (embedded, immutable database) should look.
+    out.push_str(&format!(
+        "## Read-only ranking ({})\n\n",
+        READ_OPS.map(|i| OPS[i]).join(", ")
+    ));
     for engine in ["SQLite", "PostgreSQL"] {
         let group: Vec<&SuiteResult> = results.iter().filter(|r| r.name.contains(engine)).collect();
         if group.is_empty() {
             continue;
         }
         out.push_str(&format!("### {engine}\n\n"));
-        out.push_str("| Rank | Suite | Relative latency |\n|---|---|---:|\n");
-        let mut scored: Vec<(&str, f64)> = group
-            .iter()
-            .map(|r| {
-                let mut log_sum = 0.0;
-                for op_idx in 0..OPS.len() {
-                    let best = group
-                        .iter()
-                        .map(|g| g.stats[op_idx].median_us)
-                        .fold(f64::INFINITY, f64::min);
-                    log_sum += (r.stats[op_idx].median_us / best).ln();
-                }
-                (r.name, (log_sum / OPS.len() as f64).exp())
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        for (rank, (name, score)) in scored.iter().enumerate() {
-            out.push_str(&format!("| {} | {name} | {score:.2}× |\n", rank + 1));
-        }
-        out.push('\n');
+        out.push_str(&ranking_table(&group, &READ_OPS));
     }
 
     // Lines-of-code proxy for developer effort: how much code each suite
@@ -204,6 +264,11 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         (
             "rusqlite (raw) + SQLite",
             loc(include_str!("suites/rusqlite_sqlite.rs")),
+            String::new(),
+        ),
+        (
+            "rusqlite (read-only) + SQLite",
+            loc(include_str!("suites/rusqlite_sqlite_readonly.rs")),
             String::new(),
         ),
         (
