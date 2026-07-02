@@ -12,6 +12,7 @@ and the most performance.
 | Layer | Type | Databases |
 |---|---|---|
 | [rusqlite](https://crates.io/crates/rusqlite) | raw driver (baseline) | SQLite |
+| rusqlite (read-only) | raw driver, `SQLITE_OPEN_READ_ONLY` + `immutable=1` | SQLite |
 | [tokio-postgres](https://crates.io/crates/tokio-postgres) | raw async driver (baseline) | PostgreSQL |
 | [SQLx](https://crates.io/crates/sqlx) | async SQL toolkit (not an ORM) | SQLite, PostgreSQL |
 | [Diesel](https://crates.io/crates/diesel) | sync compile-time-checked ORM/query builder | SQLite, PostgreSQL |
@@ -31,8 +32,15 @@ access layer itself, not from setup differences.
 6. `update_one` — update one column by primary key
 7. `delete_one` — delete one row by primary key
 
-**Fairness rules:** identical schema and seed data everywhere; SQLite always runs
-WAL + `synchronous=NORMAL`; Postgres suites all talk to the same local server over
+The read-only suite runs only the three read operations (`fetch_by_id`,
+`fetch_page_50`, `join_top_50`); the harness skips writes for it and it is ranked
+separately. It models a database deployed on a read-only filesystem (embedded
+Linux, squashfs): the file is seeded by a writable connection, then reopened with
+`SQLITE_OPEN_READ_ONLY` and `immutable=1`, which skips all locking and change
+detection and never creates journal/WAL files.
+
+**Fairness rules:** identical schema and seed data everywhere; writable SQLite
+suites run WAL + `synchronous=NORMAL`; Postgres suites all talk to the same local server over
 TCP with one connection; every read materializes rows into typed structs; results
 are verified (`ensure!`) so no suite can skip work.
 
@@ -60,27 +68,42 @@ median latency):
 
 | SQLite | | PostgreSQL | |
 |---|---:|---|---:|
-| rusqlite (raw) | 1.00× | **Diesel** | **1.03×** |
-| **Diesel** | **1.26×** | tokio-postgres (raw) | 1.19× |
-| SQLx | 19.8× | SQLx | 1.89× |
-| SeaORM | 20.5× | SeaORM | 1.97× |
+| rusqlite (raw) | 1.00× | **Diesel** | **1.00×** |
+| **Diesel** | **1.31×** | tokio-postgres (raw) | 1.27× |
+| SeaORM | 29.3× | SeaORM | 2.02× |
+| SQLx | 30.4× | SQLx | 2.03× |
+
+The read-only suite skips writes, so it is ranked separately over the three read
+operations (from RESULTS.md):
+
+| SQLite, reads only | |
+|---|---:|
+| **rusqlite (read-only, immutable)** | **1.00×** |
+| rusqlite (raw, WAL) | 1.48× |
+| Diesel | 1.77× |
+| SeaORM | 58.5× |
+| SQLx | 65.8× |
 
 Representative absolute numbers (median):
 
-| Operation | Diesel+SQLite | SQLx+SQLite | Diesel+PG | SQLx+PG | SeaORM+PG |
-|---|---:|---:|---:|---:|---:|
-| fetch_by_id | 2.3 µs | 176 µs | 66 µs | 251 µs | 274 µs |
-| fetch_page_50 | 24 µs | 393 µs | 114 µs | 332 µs | 334 µs |
-| insert_one | 8.3 µs | 181 µs | 1.06 ms | 1.31 ms | 1.32 ms |
+| Operation | rusqlite read-only | Diesel+SQLite | SQLx+SQLite | Diesel+PG | SQLx+PG | SeaORM+PG |
+|---|---:|---:|---:|---:|---:|---:|
+| fetch_by_id | 0.8 µs | 2.3 µs | 290 µs | 98 µs | 452 µs | 414 µs |
+| fetch_page_50 | 15 µs | 23 µs | 476 µs | 156 µs | 494 µs | 523 µs |
+| insert_one | n/a | 8.3 µs | 299 µs | 822 µs | 1.19 ms | 1.17 ms |
 
 Key takeaways from the numbers:
 
 - **Diesel is effectively free.** On both engines it benchmarks at raw-driver speed
   (it even beat raw tokio-postgres on reads — sync libpq round-trips have less
   per-call overhead than an async executor on a single connection).
-- **SQLx/SeaORM pay a large tax on SQLite (~20×).** sqlx's SQLite driver runs each
+- **Read-only immutable SQLite is the fastest configuration measured, ~1.5× faster
+  than WAL on reads.** `immutable=1` tells SQLite the file cannot change, so it
+  skips per-query locking and change detection entirely — a point-read drops from
+  2.1 µs to 0.8 µs. It also works on a read-only mount, where WAL cannot even open.
+- **SQLx/SeaORM pay a large tax on SQLite (~30×).** sqlx's SQLite driver runs each
   connection on a dedicated background thread and every command crosses a channel,
-  so a 2 µs point-read costs ~175 µs. If your database is embedded SQLite, an async
+  so a 2 µs point-read costs ~290 µs. If your database is embedded SQLite, an async
   driver is actively counterproductive.
 - **On Postgres the gap compresses** because network round-trips and WAL fsync
   dominate writes (~1 ms), but on reads Diesel is still ~2–4× faster than
@@ -126,6 +149,12 @@ compile time, so it's not this benchmark's winner on either axis.
 **Avoid SQLx/SeaORM with SQLite** in latency-sensitive paths — use Diesel or
 rusqlite for embedded databases.
 
+**Read-only embedded deployments (read-only rootfs, squashfs): open SQLite with
+`SQLITE_OPEN_READ_ONLY` and `immutable=1`.** It benchmarked fastest of everything
+here (~1.5× faster than WAL on reads), needs no journal or lock files, and the
+database file stays hand-editable offline with any SQLite tool before it is baked
+into the image.
+
 ### Which database?
 
 SQLite and Postgres solve different problems, but the numbers frame the tradeoff:
@@ -145,6 +174,7 @@ src/
 └── suites/
     ├── mod.rs              # Suite trait, shared DDL + seed data
     ├── rusqlite_sqlite.rs
+    ├── rusqlite_sqlite_readonly.rs  # SQLITE_OPEN_READ_ONLY + immutable=1, reads only
     ├── tokio_postgres_pg.rs
     ├── sqlx_sqlite.rs
     ├── sqlx_postgres.rs
