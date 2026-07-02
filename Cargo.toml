@@ -12,6 +12,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-postgres = "0.7"
 
+# Purpose-built read-oriented embedded engines
+duckdb = { version = "1", features = ["bundled"] }
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
 # SQLx — async SQL toolkit (not a full ORM)
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",

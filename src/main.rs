@@ -55,6 +55,8 @@ fn main() -> Result<()> {
         Box::new(suites::seaorm_sqlite::SeaOrmSqlite::new(sqlite_db(
             "seaorm",
         ))?),
+        Box::new(suites::duckdb_duckdb::DuckDb::new(sqlite_db("duckdb"))?),
+        Box::new(suites::redb_redb::Redb::new(sqlite_db("redb"))?),
     ];
     if pg_available {
         all_suites.push(Box::new(suites::tokio_postgres_pg::TokioPostgres::new()?));
@@ -161,12 +163,17 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
     }
 
     // Overall ranking: geometric mean of each suite's slowdown vs. the
-    // fastest suite per operation, computed separately per database engine
-    // (comparing SQLite latencies against Postgres round-trips would be
-    // apples to oranges).
+    // fastest suite per operation. Embedded engines (SQLite, DuckDB, redb)
+    // compete in one group; comparing their in-process latencies against
+    // Postgres network round-trips would be apples to oranges.
     out.push_str("## Overall ranking (geometric mean of relative latency, 1.00 = fastest)\n\n");
-    for engine in ["SQLite", "PostgreSQL"] {
-        let group: Vec<&SuiteResult> = results.iter().filter(|r| r.name.contains(engine)).collect();
+    let is_pg = |r: &&SuiteResult| r.name.contains("PostgreSQL");
+    for engine in ["Embedded (SQLite / DuckDB / redb)", "PostgreSQL"] {
+        let group: Vec<&SuiteResult> = if engine == "PostgreSQL" {
+            results.iter().filter(is_pg).collect()
+        } else {
+            results.iter().filter(|r| !is_pg(r)).collect()
+        };
         if group.is_empty() {
             continue;
         }
@@ -209,6 +216,16 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         (
             "tokio-postgres (raw) + PostgreSQL",
             loc(include_str!("suites/tokio_postgres_pg.rs")),
+            String::new(),
+        ),
+        (
+            "duckdb-rs + DuckDB",
+            loc(include_str!("suites/duckdb_duckdb.rs")),
+            String::new(),
+        ),
+        (
+            "redb (embedded KV)",
+            loc(include_str!("suites/redb_redb.rs")),
             String::new(),
         ),
         (

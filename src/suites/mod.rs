@@ -3,6 +3,8 @@ use anyhow::Result;
 pub mod diesel_postgres;
 pub mod diesel_schema;
 pub mod diesel_sqlite;
+pub mod duckdb_duckdb;
+pub mod redb_redb;
 pub mod rusqlite_sqlite;
 pub mod seaorm_entities;
 pub mod seaorm_postgres;
@@ -50,9 +52,10 @@ pub trait Suite {
     }
 }
 
-/// Plain row type used by the raw-driver suites (rusqlite / tokio-postgres).
+/// Plain row type used by the raw-driver suites (rusqlite / tokio-postgres)
+/// and, serialized with bincode, as the value type in the redb KV suite.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserRow {
     pub id: i32,
     pub name: String,
@@ -61,10 +64,19 @@ pub struct UserRow {
     pub age: i32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PostRow {
+    pub user_id: i32,
+    pub title: String,
+    pub body: String,
+    pub published: bool,
+}
+
 #[derive(Clone, Copy)]
 pub enum Dialect {
     Sqlite,
     Postgres,
+    DuckDb,
 }
 
 impl Dialect {
@@ -77,7 +89,7 @@ impl Dialect {
                     "0"
                 }
             }
-            Dialect::Postgres => {
+            Dialect::Postgres | Dialect::DuckDb => {
                 if b {
                     "TRUE"
                 } else {
@@ -89,22 +101,34 @@ impl Dialect {
 }
 
 pub fn ddl(dialect: Dialect) -> String {
-    let (pk, int) = match dialect {
-        Dialect::Sqlite => ("INTEGER PRIMARY KEY", "INTEGER"),
-        Dialect::Postgres => ("SERIAL PRIMARY KEY", "INT"),
+    let (prelude, users_pk, posts_pk, int) = match dialect {
+        Dialect::Sqlite => ("", "INTEGER PRIMARY KEY", "INTEGER PRIMARY KEY", "INTEGER"),
+        Dialect::Postgres => ("", "SERIAL PRIMARY KEY", "SERIAL PRIMARY KEY", "INT"),
+        // DuckDB has no SERIAL/AUTOINCREMENT; sequences start past every
+        // explicitly seeded id so default inserts cannot collide.
+        Dialect::DuckDb => (
+            "DROP SEQUENCE IF EXISTS users_id_seq;\n\
+             DROP SEQUENCE IF EXISTS posts_id_seq;\n\
+             CREATE SEQUENCE users_id_seq START 200001;\n\
+             CREATE SEQUENCE posts_id_seq START 200001;\n",
+            "INTEGER PRIMARY KEY DEFAULT nextval('users_id_seq')",
+            "INTEGER PRIMARY KEY DEFAULT nextval('posts_id_seq')",
+            "INTEGER",
+        ),
     };
     format!(
         "DROP TABLE IF EXISTS posts;\n\
          DROP TABLE IF EXISTS users;\n\
+         {prelude}\
          CREATE TABLE users (\n\
-             id {pk},\n\
+             id {users_pk},\n\
              name TEXT NOT NULL,\n\
              email TEXT NOT NULL,\n\
              active BOOLEAN NOT NULL,\n\
              age {int} NOT NULL\n\
          );\n\
          CREATE TABLE posts (\n\
-             id {pk},\n\
+             id {posts_pk},\n\
              user_id {int} NOT NULL REFERENCES users(id),\n\
              title TEXT NOT NULL,\n\
              body TEXT NOT NULL,\n\
@@ -114,46 +138,81 @@ pub fn ddl(dialect: Dialect) -> String {
     )
 }
 
-/// Deterministic seed data, generated as raw multi-row INSERT statements so
-/// every suite starts from byte-identical state regardless of its ORM.
+/// Deterministic seed rows: users with explicit ids 1..=SEED_USERS plus
+/// `delete_rows` delete targets above DELETE_BASE.
+pub fn seed_users(delete_rows: u32) -> Vec<UserRow> {
+    let mut rows = Vec::new();
+    for i in 1..=SEED_USERS {
+        rows.push(UserRow {
+            id: i as i32,
+            name: format!("user{i}"),
+            email: format!("user{i}@example.com"),
+            active: i % 4 != 0,
+            age: (20 + i % 50) as i32,
+        });
+    }
+    for i in 1..=delete_rows {
+        rows.push(UserRow {
+            id: (DELETE_BASE + i) as i32,
+            name: format!("victim{i}"),
+            email: format!("victim{i}@example.com"),
+            active: true,
+            age: 30,
+        });
+    }
+    rows
+}
+
+pub fn seed_posts() -> Vec<PostRow> {
+    (1..=SEED_POSTS)
+        .map(|i| PostRow {
+            user_id: (1 + i % SEED_USERS) as i32,
+            title: format!("post title {i}"),
+            body: format!("lorem ipsum body text for post {i}"),
+            published: i % 3 != 0,
+        })
+        .collect()
+}
+
+/// The same seed rows rendered as raw multi-row INSERT statements so every
+/// SQL suite starts from byte-identical state regardless of its ORM.
 pub fn seed_sql(dialect: Dialect, delete_rows: u32) -> Vec<String> {
     let mut stmts = Vec::new();
     let chunk = 500;
 
-    // Users with explicit ids 1..=SEED_USERS.
-    let mut rows: Vec<String> = Vec::new();
-    for i in 1..=SEED_USERS {
-        rows.push(format!(
-            "({i},'user{i}','user{i}@example.com',{},{})",
-            dialect.bool_lit(i % 4 != 0),
-            20 + i % 50
-        ));
-    }
-    // Delete targets with explicit ids above DELETE_BASE.
-    for i in 1..=delete_rows {
-        let id = DELETE_BASE + i;
-        rows.push(format!(
-            "({id},'victim{i}','victim{i}@example.com',{},30)",
-            dialect.bool_lit(true)
-        ));
-    }
-    for c in rows.chunks(chunk) {
+    let users: Vec<String> = seed_users(delete_rows)
+        .iter()
+        .map(|u| {
+            format!(
+                "({},'{}','{}',{},{})",
+                u.id,
+                u.name,
+                u.email,
+                dialect.bool_lit(u.active),
+                u.age
+            )
+        })
+        .collect();
+    for c in users.chunks(chunk) {
         stmts.push(format!(
             "INSERT INTO users (id,name,email,active,age) VALUES {};",
             c.join(",")
         ));
     }
 
-    // Posts referencing seeded users (auto ids).
-    let mut rows: Vec<String> = Vec::new();
-    for i in 1..=SEED_POSTS {
-        rows.push(format!(
-            "({},'post title {i}','lorem ipsum body text for post {i}',{})",
-            1 + i % SEED_USERS,
-            dialect.bool_lit(i % 3 != 0)
-        ));
-    }
-    for c in rows.chunks(chunk) {
+    let posts: Vec<String> = seed_posts()
+        .iter()
+        .map(|p| {
+            format!(
+                "({},'{}','{}',{})",
+                p.user_id,
+                p.title,
+                p.body,
+                dialect.bool_lit(p.published)
+            )
+        })
+        .collect();
+    for c in posts.chunks(chunk) {
         stmts.push(format!(
             "INSERT INTO posts (user_id,title,body,published) VALUES {};",
             c.join(",")
