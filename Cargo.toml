@@ -9,7 +9,7 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Raw drivers (baselines)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 tokio-postgres = "0.7"
 
 # SQLx — async SQL toolkit (not a full ORM)

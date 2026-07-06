@@ -13,6 +13,7 @@ and the most performance.
 |---|---|---|
 | [rusqlite](https://crates.io/crates/rusqlite) | raw driver (baseline) | SQLite |
 | rusqlite (read-only) | raw driver, `SQLITE_OPEN_READ_ONLY` + `immutable=1` | SQLite |
+| rusqlite (in-memory) | raw driver, `:memory:` database loaded from disk via the backup API | SQLite |
 | [tokio-postgres](https://crates.io/crates/tokio-postgres) | raw async driver (baseline) | PostgreSQL |
 | [SQLx](https://crates.io/crates/sqlx) | async SQL toolkit (not an ORM) | SQLite, PostgreSQL |
 | [Diesel](https://crates.io/crates/diesel) | sync compile-time-checked ORM/query builder | SQLite, PostgreSQL |
@@ -39,7 +40,13 @@ Linux, squashfs): the file is seeded by a writable connection, then reopened wit
 `SQLITE_OPEN_READ_ONLY` and `immutable=1`, which skips all locking and change
 detection and never creates journal/WAL files.
 
-**Fairness rules:** identical schema and seed data everywhere; writable SQLite
+The in-memory suite measures the impact of loading the whole database into RAM:
+the same seeded file is copied page-by-page into a `:memory:` connection with the
+SQLite backup API (the one-time load cost is printed during the run), then all
+seven operations run against memory only — no filesystem, no fsync, no journal
+files. Writes are not durable: they die with the process.
+
+**Fairness rules:** identical schema and seed data everywhere; writable on-disk SQLite
 suites run WAL + `synchronous=NORMAL`; Postgres suites all talk to the same local server over
 TCP with one connection; every read materializes rows into typed structs; results
 are verified (`ensure!`) so no suite can skip work.
@@ -68,43 +75,56 @@ median latency):
 
 | SQLite | | PostgreSQL | |
 |---|---:|---|---:|
-| rusqlite (raw) | 1.00× | **Diesel** | **1.00×** |
-| **Diesel** | **1.31×** | tokio-postgres (raw) | 1.27× |
-| SeaORM | 29.3× | SeaORM | 2.02× |
-| SQLx | 30.4× | SQLx | 2.03× |
+| **rusqlite (in-memory)** | **1.00×** | **Diesel** | **1.00×** |
+| rusqlite (raw, WAL) | 2.50× | tokio-postgres (raw) | 1.25× |
+| Diesel | 3.18× | SQLx | 1.95× |
+| SQLx | 62.8× | SeaORM | 2.05× |
+| SeaORM | 65.9× | | |
 
 The read-only suite skips writes, so it is ranked separately over the three read
 operations (from RESULTS.md):
 
 | SQLite, reads only | |
 |---|---:|
-| **rusqlite (read-only, immutable)** | **1.00×** |
-| rusqlite (raw, WAL) | 1.48× |
-| Diesel | 1.77× |
-| SeaORM | 58.5× |
-| SQLx | 65.8× |
+| **rusqlite (read-only, immutable)** | **1.02×** |
+| **rusqlite (in-memory)** | **1.02×** |
+| rusqlite (raw, WAL) | 1.44× |
+| Diesel | 1.67× |
+| SeaORM | 52.7× |
+| SQLx | 53.6× |
 
 Representative absolute numbers (median):
 
-| Operation | rusqlite read-only | Diesel+SQLite | SQLx+SQLite | Diesel+PG | SQLx+PG | SeaORM+PG |
+| Operation | rusqlite in-memory | rusqlite read-only | Diesel+SQLite | SQLx+SQLite | Diesel+PG | SQLx+PG |
 |---|---:|---:|---:|---:|---:|---:|
-| fetch_by_id | 0.8 µs | 2.3 µs | 290 µs | 98 µs | 452 µs | 414 µs |
-| fetch_page_50 | 15 µs | 23 µs | 476 µs | 156 µs | 494 µs | 523 µs |
-| insert_one | n/a | 8.3 µs | 299 µs | 822 µs | 1.19 ms | 1.17 ms |
+| fetch_by_id | 0.7 µs | 0.7 µs | 1.7 µs | 182 µs | 70 µs | 282 µs |
+| fetch_page_50 | 14 µs | 14 µs | 20 µs | 392 µs | 114 µs | 341 µs |
+| insert_one | 1.0 µs | n/a | 7.2 µs | 186 µs | 960 µs | 1.35 ms |
 
 Key takeaways from the numbers:
 
+- **Loading the database in memory speeds up writes ~5–6× but barely moves
+  reads.** `insert_one` drops from 6.4 µs (WAL on disk) to 1.0 µs, `update_one`
+  from 5.6 µs to 1.1 µs, `delete_one` from 5.5 µs to 1.0 µs — nothing touches the
+  filesystem, so all journal and sync work disappears. Reads land exactly on the
+  read-only immutable numbers (0.7 µs point-read): a warm on-disk database is
+  already served from the OS page cache, so RAM residency itself buys nothing —
+  the ~1.4× read win over WAL comes from skipping locking/change-detection, which
+  `immutable=1` achieves without giving up the on-disk file. The one-time load
+  cost is trivial at this size (0.4 MiB in 0.1 ms, via the backup API) and scales
+  linearly. The price: writes are not durable — the database dies with the process.
 - **Diesel is effectively free.** On both engines it benchmarks at raw-driver speed
   (it even beat raw tokio-postgres on reads — sync libpq round-trips have less
   per-call overhead than an async executor on a single connection).
-- **Read-only immutable SQLite is the fastest configuration measured, ~1.5× faster
-  than WAL on reads.** `immutable=1` tells SQLite the file cannot change, so it
-  skips per-query locking and change detection entirely — a point-read drops from
-  2.1 µs to 0.8 µs. It also works on a read-only mount, where WAL cannot even open.
-- **SQLx/SeaORM pay a large tax on SQLite (~30×).** sqlx's SQLite driver runs each
-  connection on a dedicated background thread and every command crosses a channel,
-  so a 2 µs point-read costs ~290 µs. If your database is embedded SQLite, an async
-  driver is actively counterproductive.
+- **Read-only immutable SQLite matches in-memory on reads while keeping the file
+  on disk, ~1.4× faster than WAL.** `immutable=1` tells SQLite the file cannot
+  change, so it skips per-query locking and change detection entirely — a
+  point-read drops from 1.6 µs to 0.7 µs. It also works on a read-only mount,
+  where WAL cannot even open.
+- **SQLx/SeaORM pay a large tax on SQLite (~25× vs. the raw driver).** sqlx's
+  SQLite driver runs each connection on a dedicated background thread and every
+  command crosses a channel, so a 2 µs point-read costs ~185 µs. If your database
+  is embedded SQLite, an async driver is actively counterproductive.
 - **On Postgres the gap compresses** because network round-trips and WAL fsync
   dominate writes (~1 ms), but on reads Diesel is still ~2–4× faster than
   SQLx/SeaORM.
@@ -128,7 +148,7 @@ LOC below is what each layer needed to implement the identical benchmark operati
 ## Recommendation
 
 **Best performance + best safety: Diesel + PostgreSQL** (or Diesel + SQLite for
-embedded/single-node — it's within 26% of raw rusqlite). You get raw-driver
+embedded/single-node — it's within ~27% of raw rusqlite). You get raw-driver
 performance, fully compile-time-checked queries, and the least per-operation code —
 the LOC table shows the DSL is *more* compact than hand-written SQL once the schema
 is declared. The costs are a steeper learning curve and a sync API: in an async web
@@ -150,16 +170,25 @@ compile time, so it's not this benchmark's winner on either axis.
 rusqlite for embedded databases.
 
 **Read-only embedded deployments (read-only rootfs, squashfs): open SQLite with
-`SQLITE_OPEN_READ_ONLY` and `immutable=1`.** It benchmarked fastest of everything
-here (~1.5× faster than WAL on reads), needs no journal or lock files, and the
-database file stays hand-editable offline with any SQLite tool before it is baked
-into the image.
+`SQLITE_OPEN_READ_ONLY` and `immutable=1`.** It ties in-memory for the fastest
+reads measured (~1.4× faster than WAL) while keeping the file on disk, needs no
+journal or lock files, and the database file stays hand-editable offline with any
+SQLite tool before it is baked into the image.
+
+**Load the database in memory only when you need fast *writes* on ephemeral
+data.** That's where the impact is: writes get ~5–6× faster because nothing is
+journaled or synced. For read speed alone, memory residency buys nothing over
+`immutable=1` (or even a warm page cache) — don't give up durability for it. Good
+fits are caches, session stores, queues of recomputable work, and test fixtures;
+the backup API loads the seed file at ~4 GiB/s here, and can also snapshot the
+memory database back to disk periodically if losing the last few minutes is
+acceptable.
 
 ### Which database?
 
 SQLite and Postgres solve different problems, but the numbers frame the tradeoff:
-local SQLite point-reads are ~30× faster than a Postgres round-trip and writes are
-~100× faster (no network, no per-commit WAL fsync at `synchronous=NORMAL`). If one
+local SQLite point-reads are ~40× faster than a Postgres round-trip and writes are
+~150× faster (no network, no per-commit WAL fsync at `synchronous=NORMAL`). If one
 process owns the data, **SQLite + Diesel** is unbeatable. The moment you need
 concurrent writers, multiple app instances, or Postgres-only SQL features (rich
 types, `unnest` bulk loading, mature tooling), **PostgreSQL + Diesel** carries the
@@ -175,6 +204,7 @@ src/
     ├── mod.rs              # Suite trait, shared DDL + seed data
     ├── rusqlite_sqlite.rs
     ├── rusqlite_sqlite_readonly.rs  # SQLITE_OPEN_READ_ONLY + immutable=1, reads only
+    ├── rusqlite_sqlite_memory.rs    # :memory: database loaded from disk via backup API
     ├── tokio_postgres_pg.rs
     ├── sqlx_sqlite.rs
     ├── sqlx_postgres.rs
@@ -191,6 +221,9 @@ src/
 - Single-connection latency is the metric. Throughput under concurrency would favor
   the async stacks more; add a concurrent scenario before generalizing to high-QPS
   services.
+- The seeded database is small (~0.4 MiB), so on-disk reads are always served from
+  the OS page cache. On a dataset larger than RAM (or a cold cache), the in-memory
+  suite's read advantage would grow — but so would its load time and memory bill.
 - Postgres write latency is dominated by WAL fsync of the local server, which
   compresses differences between layers on insert/update/delete.
 - SQLx was measured with runtime queries (`query`/`query_as`); the `query!` macros
