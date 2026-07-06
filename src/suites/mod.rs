@@ -4,6 +4,7 @@ pub mod diesel_postgres;
 pub mod diesel_schema;
 pub mod diesel_sqlite;
 pub mod rusqlite_sqlite;
+pub mod rusqlite_sqlite_memory;
 pub mod rusqlite_sqlite_readonly;
 pub mod seaorm_entities;
 pub mod seaorm_postgres;

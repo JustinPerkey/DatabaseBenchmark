@@ -56,6 +56,9 @@ fn main() -> Result<()> {
                 "rusqlite_ro",
             ))?,
         ),
+        Box::new(suites::rusqlite_sqlite_memory::RusqliteSqliteMemory::new(
+            sqlite_db("rusqlite_mem"),
+        )?),
         Box::new(suites::sqlx_sqlite::SqlxSqlite::new(sqlite_db("sqlx"))?),
         Box::new(suites::diesel_sqlite::DieselSqlite::new(sqlite_db(
             "diesel",
@@ -269,6 +272,11 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         (
             "rusqlite (read-only) + SQLite",
             loc(include_str!("suites/rusqlite_sqlite_readonly.rs")),
+            String::new(),
+        ),
+        (
+            "rusqlite (in-memory) + SQLite",
+            loc(include_str!("suites/rusqlite_sqlite_memory.rs")),
             String::new(),
         ),
         (
