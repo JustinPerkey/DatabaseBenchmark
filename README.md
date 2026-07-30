@@ -17,7 +17,7 @@ and the most performance.
 | [tokio-postgres](https://crates.io/crates/tokio-postgres) | raw async driver (baseline) | PostgreSQL |
 | [SQLx](https://crates.io/crates/sqlx) | async SQL toolkit (not an ORM) | SQLite, PostgreSQL |
 | [Diesel](https://crates.io/crates/diesel) | sync compile-time-checked ORM/query builder | SQLite, PostgreSQL |
-| [SeaORM](https://crates.io/crates/sea-orm) | async dynamic ORM (built on SQLx) | SQLite, PostgreSQL |
+| [SeaORM](https://crates.io/crates/sea-orm) 2.0 | async dynamic ORM (built on SQLx) | SQLite, PostgreSQL |
 
 Every suite implements the same trait ([`src/suites/mod.rs`](src/suites/mod.rs)) and is
 seeded with byte-identical data via raw SQL, so the measured differences come from the
@@ -145,6 +145,74 @@ LOC below is what each layer needed to implement the identical benchmark operati
 | Learning curve | steep (trait-heavy, famously long error messages) | shallow (it's just SQL) | moderate (ActiveModel conventions) | shallow but verbose |
 | Escape hatch to raw SQL | ✅ | n/a (it is SQL) | ✅ | n/a |
 
+## SeaORM 2.0 upgrade
+
+The benchmark now runs **SeaORM 2.0** (released 2026-07-19). It was tested against
+1.1.20 before switching, both for migration cost and for regressions.
+
+### Migration cost: zero source changes
+
+The only edit was the version string in `Cargo.toml`. `seaorm_entities.rs`,
+`seaorm_sqlite.rs` and `seaorm_postgres.rs` compile untouched, without warnings.
+The 2.0 breaking changes that could plausibly have hit this code did not:
+
+| Breaking change | Why it didn't bite |
+|---|---|
+| `insert_many` overhauled (`InsertMany`, `last_insert_id` now `Option<Value>`) | `insert_many(rows).exec(db)` still infers and still returns a usable result; the new API only matters if you read `last_insert_id` or pass a possibly-empty iterator |
+| `delete_by_id` returns `ValidatedDeleteOne` instead of `DeleteMany` | `.exec()` is unchanged; only `exec_with_returning` changes shape |
+| `execute`/`query_one`/`query_all` now take SeaQuery statements, with `*_raw` for SQL | the suites use `execute_unprepared`, which is unchanged |
+| `DatabaseConnection` became a struct (enum moved to `.inner`) | never matched on |
+| SeaQuery 1.0 wants `use sea_orm::ExprTrait` in scope | `ColumnTrait::eq` and `Expr::value` cover everything used here |
+
+What does change underneath: sea-orm 2.0 pulls **SQLx 0.9** and **SeaQuery 1.0**,
+is built on **edition 2024**, and raises the MSRV to **Rust 1.94**. Because the
+SQLx suites still pin 0.8, the binary links both SQLx majors side by side — fine
+for Cargo, but worth knowing if you plan to share types between an ORM and a
+hand-rolled SQLx layer.
+
+### Behaviour: identical SQL
+
+With `log_statement=all` on the Postgres server, the 41 distinct statements the
+whole benchmark emits are byte-identical between 1.1.20 and 2.0.0. SeaORM still
+sends one multi-row `VALUES` list for `insert_many`, `RETURNING "id"` for
+`insert_one`, and the same aliased `A_*`/`B_*` projection for
+`find_also_related`. Nothing about the generated queries changed.
+
+### Performance: no measurable change
+
+Both versions were built as separate binaries and run interleaved, 40 full runs
+each (20 in each ordering, to cancel order bias). Numbers are the median across
+runs of each run's median per-operation latency. This A/B ran in a slower
+container than the reference environment used for the tables above, so read the
+columns against each other, not against [RESULTS.md](RESULTS.md) — those tables
+are still from the reference machine, and the equivalence shown here is what
+makes them valid for 2.0:
+
+| op | SeaORM + SQLite | | | SeaORM + PostgreSQL | | |
+|---|---:|---:|---:|---:|---:|---:|
+| | 1.1.20 | 2.0.0 | Δ | 1.1.20 | 2.0.0 | Δ |
+| insert_one | 277.4 µs | 276.2 µs | −0.4% | 1330 µs | 1361 µs | +2.3% |
+| insert_bulk_100 | 360.0 µs | 399.0 µs | +10.8%* | 1886 µs | 1903 µs | +0.9% |
+| fetch_by_id | 261.8 µs | 260.4 µs | −0.5% | 422 µs | 417 µs | −1.3% |
+| fetch_page_50 | 353.4 µs | 332.3 µs | −6.0% | 504 µs | 499 µs | −1.0% |
+| join_top_50 | 408.8 µs | 393.7 µs | −3.7% | 704 µs | 702 µs | −0.3% |
+| update_one | 271.9 µs | 270.1 µs | −0.7% | 1345 µs | 1353 µs | +0.6% |
+| delete_one | 272.6 µs | 268.2 µs | −1.6% | 1378 µs | 1384 µs | +0.4% |
+
+\* **Not a SeaORM regression.** Every SQLite bulk insert in the 2.0 binary got
+slower, including Diesel's (+6.9%) and SQLx's (+3.2%) — suites whose code and
+dependencies are byte-identical in both binaries — so it tracks the process, not
+the ORM. Re-running `insert_many` on its own in a standalone crate (nothing else
+linked, 15 interleaved rounds) gives 320.5 µs on 1.1 vs 327.4 µs on 2.0 by median
+and 296.9 µs vs 290.6 µs by minimum: ±2%, i.e. nothing.
+
+The noise floor for the async suites here is roughly ±10%: the same control
+comparison shows SQLx + PostgreSQL "improving" 11% between two identical binaries.
+The sync suites are the stable reference — rusqlite reproduces to 0.0% on every
+operation. Read the SeaORM deltas above against that background, and the
+conclusion is that **2.0 is a drop-in upgrade with performance indistinguishable
+from 1.1** for these seven operations.
+
 ## Recommendation
 
 **Best performance + best safety: Diesel + PostgreSQL** (or Diesel + SQLite for
@@ -230,3 +298,10 @@ src/
   add compile-time checking but identical runtime behavior.
 - MySQL/MariaDB and libraries like `sea-query`-only, `cornucopia`, or `welds` are
   not (yet) included.
+- The async suites reproduce to roughly ±10% between runs on this machine, so
+  treat any single-digit difference between two async layers as a tie. Rebuilding
+  the same benchmark against a different dependency set can shift the async
+  numbers by that much on its own — see the SeaORM 2.0 section for how that was
+  controlled for.
+- SeaORM 2.0 requires Rust 1.94 or newer; the rest of the suite builds on older
+  toolchains.
