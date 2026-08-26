@@ -63,6 +63,9 @@ fn main() -> Result<()> {
         Box::new(suites::diesel_sqlite::DieselSqlite::new(sqlite_db(
             "diesel",
         ))?),
+        Box::new(suites::diesel_sqlite_memory::DieselSqliteMemory::new(
+            sqlite_db("diesel_mem"),
+        )?),
         Box::new(suites::seaorm_sqlite::SeaOrmSqlite::new(sqlite_db(
             "seaorm",
         ))?),
@@ -297,6 +300,11 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         (
             "Diesel + SQLite",
             loc(include_str!("suites/diesel_sqlite.rs")),
+            format!("+{diesel_schema} (schema/models)"),
+        ),
+        (
+            "Diesel (in-memory) + SQLite",
+            loc(include_str!("suites/diesel_sqlite_memory.rs")),
             format!("+{diesel_schema} (schema/models)"),
         ),
         (
