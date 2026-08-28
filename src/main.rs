@@ -66,6 +66,9 @@ fn main() -> Result<()> {
         Box::new(suites::diesel_sqlite_memory::DieselSqliteMemory::new(
             sqlite_db("diesel_mem"),
         )?),
+        Box::new(suites::diesel_async_sqlite::DieselAsyncSqlite::new(
+            sqlite_db("diesel_async"),
+        )?),
         Box::new(suites::seaorm_sqlite::SeaOrmSqlite::new(sqlite_db(
             "seaorm",
         ))?),
@@ -74,6 +77,9 @@ fn main() -> Result<()> {
         all_suites.push(Box::new(suites::tokio_postgres_pg::TokioPostgres::new()?));
         all_suites.push(Box::new(suites::sqlx_postgres::SqlxPostgres::new()?));
         all_suites.push(Box::new(suites::diesel_postgres::DieselPostgres::new()?));
+        all_suites.push(Box::new(
+            suites::diesel_async_postgres::DieselAsyncPostgres::new()?,
+        ));
         all_suites.push(Box::new(suites::seaorm_postgres::SeaOrmPostgres::new()?));
     }
 
@@ -230,8 +236,10 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
     // (comparing SQLite latencies against Postgres round-trips would be
     // apples to oranges).
     out.push_str("## Overall ranking (geometric mean of relative latency, 1.00 = fastest)\n\n");
-    out.push_str("Read-only suites skip the write operations, so they are excluded here and \
-                  ranked in the read-only section below.\n\n");
+    out.push_str(
+        "Read-only suites skip the write operations, so they are excluded here and \
+                  ranked in the read-only section below.\n\n",
+    );
     for engine in ["SQLite", "PostgreSQL"] {
         let group: Vec<&SuiteResult> = results
             .iter()
@@ -310,6 +318,16 @@ fn render_report(results: &[SuiteResult], cfg: &BenchConfig) -> String {
         (
             "Diesel + PostgreSQL",
             loc(include_str!("suites/diesel_postgres.rs")),
+            format!("+{diesel_schema} (schema/models)"),
+        ),
+        (
+            "Diesel-async + SQLite",
+            loc(include_str!("suites/diesel_async_sqlite.rs")),
+            format!("+{diesel_schema} (schema/models)"),
+        ),
+        (
+            "Diesel-async + PostgreSQL",
+            loc(include_str!("suites/diesel_async_postgres.rs")),
             format!("+{diesel_schema} (schema/models)"),
         ),
         (
