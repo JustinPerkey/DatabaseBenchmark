@@ -21,11 +21,14 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 # Diesel — sync, compile-time-checked query builder / ORM
-diesel = { version = "2.2", features = [
+diesel = { version = "2.3", features = [
     "sqlite",
     "postgres",
     "returning_clauses_for_sqlite_3_35",
 ] }
+
+# diesel-async — async connections for Diesel's query builder
+diesel-async = { version = "0.9", features = ["postgres", "sqlite"] }
 
 # SeaORM — async, dynamic ORM built on SQLx
 sea-orm = { version = "2.0", default-features = false, features = [

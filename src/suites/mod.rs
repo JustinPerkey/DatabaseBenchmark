@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+pub mod diesel_async_postgres;
+pub mod diesel_async_sqlite;
 pub mod diesel_postgres;
 pub mod diesel_schema;
 pub mod diesel_sqlite;
